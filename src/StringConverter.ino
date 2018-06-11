@@ -54,6 +54,12 @@ void formatMAC(const uint8_t* mac, char (&strMAC)[20]) {
   sprintf_P(strMAC, PSTR("%02X:%02X:%02X:%02X:%02X:%02X"), mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
+String formatMAC(const uint8_t* mac) {
+  char str[20];
+  formatMAC(mac, str);
+  return String(str);
+}
+
 /*********************************************************************************************\
    Workaround for removing trailing white space when String() converts a float with 0 decimals
   \*********************************************************************************************/
@@ -67,18 +73,52 @@ String toString(float value, byte decimals)
 /*********************************************************************************************\
    Format a value to the set number of decimals
   \*********************************************************************************************/
-String formatUserVar(struct EventStruct *event, byte rel_index)
-{
-  float f(UserVar[event->BaseVarIndex + rel_index]);
-  if (!isValidFloat(f)) {
+String doFormatUserVar(byte TaskIndex, byte rel_index, bool mustCheck, bool& isvalid) {
+  isvalid = true;
+  const byte BaseVarIndex = TaskIndex * VARS_PER_TASK;
+  const byte DeviceIndex = getDeviceIndex(Settings.TaskDeviceNumber[TaskIndex]);
+  if (Device[DeviceIndex].ValueCount <= rel_index) {
+    isvalid = false;
+    String log = F("No sensor value for TaskIndex: ");
+    log += TaskIndex;
+    log += F(" varnumber: ");
+    log += rel_index;
+    addLog(LOG_LEVEL_ERROR, log);
+    return "";
+  }
+  if (Device[DeviceIndex].VType == SENSOR_TYPE_LONG) {
+    return String((unsigned long)UserVar[BaseVarIndex] + ((unsigned long)UserVar[BaseVarIndex + 1] << 16));
+  }
+  float f(UserVar[BaseVarIndex + rel_index]);
+  if (mustCheck && !isValidFloat(f)) {
+    isvalid = false;
     String log = F("Invalid float value for TaskIndex: ");
-    log += event->TaskIndex;
+    log += TaskIndex;
     log += F(" varnumber: ");
     log += rel_index;
     addLog(LOG_LEVEL_DEBUG, log);
     f = 0;
   }
   return toString(f, ExtraTaskSettings.TaskDeviceValueDecimals[rel_index]);
+}
+
+String formatUserVarNoCheck(byte TaskIndex, byte rel_index) {
+  bool isvalid;
+  return doFormatUserVar(TaskIndex, rel_index, false, isvalid);
+}
+
+String formatUserVar(byte TaskIndex, byte rel_index, bool& isvalid) {
+  return doFormatUserVar(TaskIndex, rel_index, true, isvalid);
+}
+
+String formatUserVarNoCheck(struct EventStruct *event, byte rel_index)
+{
+  return formatUserVarNoCheck(event->TaskIndex, rel_index);
+}
+
+String formatUserVar(struct EventStruct *event, byte rel_index, bool& isvalid)
+{
+  return formatUserVar(event->TaskIndex, rel_index, isvalid);
 }
 
 /*********************************************************************************************\
@@ -102,7 +142,15 @@ String to_json_object_value(const String& object, const String& value) {
   result = wrap_String(object, F("\""));
   result += F(":");
   if (value.length() == 0 || !isFloat(value)) {
-    result += wrap_String(value, F("\""));
+    if (value.indexOf('\n') == -1 && value.indexOf('"') == -1 && value.indexOf(F("Pragma")) == -1) {
+      result += wrap_String(value, F("\""));
+    } else {
+      String tmpValue(value);
+      tmpValue.replace('\n', '^');
+      tmpValue.replace('"', '\'');
+      tmpValue.replace(F("Pragma"), F("Bugje!"));
+      result += wrap_String(tmpValue, F("\""));
+    }
   } else {
     result += value;
   }
@@ -116,8 +164,8 @@ String to_json_object_value(const String& object, const String& value) {
 String parseString(String& string, byte indexFind)
 {
   String tmpString = string;
-  tmpString += ",";
-  tmpString.replace(" ", ",");
+  tmpString += ',';
+  tmpString.replace(' ', ',');
   String locateString = "";
   byte count = 0;
   int index = tmpString.indexOf(',');
@@ -144,7 +192,7 @@ int getParamStartPos(String& string, byte indexFind)
 {
   String tmpString = string;
   byte count = 0;
-  tmpString.replace(" ", ",");
+  tmpString.replace(' ', ',');
   for (unsigned int x = 0; x < tmpString.length(); x++)
   {
     if (tmpString.charAt(x) == ',')
@@ -160,11 +208,11 @@ int getParamStartPos(String& string, byte indexFind)
 //escapes special characters in strings for use in html-forms
 void htmlEscape(String & html)
 {
-  html.replace("&",  "&amp;");
-  html.replace("\"", "&quot;");
-  html.replace("'",  "&#039;");
-  html.replace("<",  "&lt;");
-  html.replace(">",  "&gt;");
+  html.replace("&",  F("&amp;"));
+  html.replace("\"", F("&quot;"));
+  html.replace("'",  F("&#039;"));
+  html.replace("<",  F("&lt;"));
+  html.replace(">",  F("&gt;"));
 }
 
 /********************************************************************************************\
@@ -277,9 +325,13 @@ void parseSystemVariables(String& s, boolean useURLencode)
   #endif
   repl(F("%CR%"), F("\r"), s, useURLencode);
   repl(F("%LF%"), F("\n"), s, useURLencode);
+  repl(F("%SP%"), F(" "), s, useURLencode); //space
+  SMART_REPL(F("%ip4%"),WiFi.localIP().toString().substring(WiFi.localIP().toString().lastIndexOf('.')+1)) //4th IP octet
   SMART_REPL(F("%ip%"),WiFi.localIP().toString())
   SMART_REPL(F("%rssi%"), String((wifiStatus == ESPEASY_WIFI_DISCONNECTED) ? 0 : WiFi.RSSI()))
   SMART_REPL(F("%ssid%"), (wifiStatus == ESPEASY_WIFI_DISCONNECTED) ? F("--") : WiFi.SSID())
+  SMART_REPL(F("%bssid%"), (wifiStatus == ESPEASY_WIFI_DISCONNECTED) ? F("00:00:00:00:00:00") : WiFi.BSSIDstr())
+  SMART_REPL(F("%wi_ch%"), String((wifiStatus == ESPEASY_WIFI_DISCONNECTED) ? 0 : WiFi.channel()))
   SMART_REPL(F("%unit%"), String(Settings.Unit))
   SMART_REPL(F("%mac%"), String(WiFi.macAddress()))
   #if defined(ESP8266)
@@ -288,6 +340,7 @@ void parseSystemVariables(String& s, boolean useURLencode)
 
   if (s.indexOf(F("%sys")) != -1) {
     SMART_REPL(F("%sysload%"), String(100 - (100 * loopCounterLast / loopCounterMax)))
+    SMART_REPL(F("%sysheap%"), String(ESP.getFreeHeap()));
     SMART_REPL(F("%systm_hm%"), getTimeString(':', false))
     SMART_REPL(F("%systm_hm_am%"), getTimeString_ampm(':', false))
     SMART_REPL(F("%systime%"), getTimeString(':'))
@@ -300,6 +353,7 @@ void parseSystemVariables(String& s, boolean useURLencode)
     SMART_REPL_TIME(F("%syshour%"), PSTR("%02d"), hour())
     SMART_REPL_TIME(F("%sysmin%"), PSTR("%02d"), minute())
     SMART_REPL_TIME(F("%syssec%"),PSTR("%02d"), second())
+    SMART_REPL_TIME(F("%syssec_d%"),PSTR("%d"), ((hour()*60) + minute())*60 + second());
     SMART_REPL_TIME(F("%sysday%"), PSTR("%02d"), day())
     SMART_REPL_TIME(F("%sysmonth%"),PSTR("%02d"), month())
     SMART_REPL_TIME(F("%sysyear%"), PSTR("%04d"), year())
@@ -314,7 +368,7 @@ void parseSystemVariables(String& s, boolean useURLencode)
   SMART_REPL(F("%unixtime%"), String(getUnixTime()))
 
   repl(F("%tskname%"), ExtraTaskSettings.TaskDeviceName, s, useURLencode);
-  if (s.indexOf("%vname") != -1) {
+  if (s.indexOf(F("%vname")) != -1) {
     repl(F("%vname1%"), ExtraTaskSettings.TaskDeviceValueNames[0], s, useURLencode);
     repl(F("%vname2%"), ExtraTaskSettings.TaskDeviceValueNames[1], s, useURLencode);
     repl(F("%vname3%"), ExtraTaskSettings.TaskDeviceValueNames[2], s, useURLencode);
@@ -325,14 +379,14 @@ void parseSystemVariables(String& s, boolean useURLencode)
 void parseEventVariables(String& s, struct EventStruct *event, boolean useURLencode)
 {
   SMART_REPL(F("%id%"), String(event->idx))
-  if (s.indexOf("%val") != -1) {
+  if (s.indexOf(F("%val")) != -1) {
     if (event->sensorType == SENSOR_TYPE_LONG) {
       SMART_REPL(F("%val1%"), String((unsigned long)UserVar[event->BaseVarIndex] + ((unsigned long)UserVar[event->BaseVarIndex + 1] << 16)))
     } else {
-      SMART_REPL(F("%val1%"), formatUserVar(event, 0))
-      SMART_REPL(F("%val2%"), formatUserVar(event, 1))
-      SMART_REPL(F("%val3%"), formatUserVar(event, 2))
-      SMART_REPL(F("%val4%"), formatUserVar(event, 3))
+      SMART_REPL(F("%val1%"), formatUserVarNoCheck(event, 0))
+      SMART_REPL(F("%val2%"), formatUserVarNoCheck(event, 1))
+      SMART_REPL(F("%val3%"), formatUserVarNoCheck(event, 2))
+      SMART_REPL(F("%val4%"), formatUserVarNoCheck(event, 3))
     }
   }
 }

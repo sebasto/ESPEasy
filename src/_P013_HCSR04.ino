@@ -1,20 +1,38 @@
 #ifdef USES_P013
 //#######################################################################################################
-//#################################### Plugin 013: HC-SR04 ##############################################
+//############################### Plugin 013: HC-SR04, RCW-0001, etc. ###################################
 //#######################################################################################################
 
 #define PLUGIN_013
 #define PLUGIN_ID_013        13
-#define PLUGIN_NAME_013       "Distance - HC-SR04"
+#define PLUGIN_NAME_013       "Distance - HC-SR04, RCW-0001, etc."
 #define PLUGIN_VALUENAME1_013 "Distance"
 
-void Plugin_013_interrupt() ICACHE_RAM_ATTR;
+#include <Arduino.h>
+#include <map>
+#include <NewPingESP8266.h>
 
-boolean Plugin_013_init = false;
-volatile unsigned long Plugin_013_timer = 0;
-volatile unsigned long Plugin_013_state = 0;
-byte Plugin_013_TRIG_Pin = 0;
-byte Plugin_013_IRQ_Pin = 0;
+struct P_013_sensordef {
+  P_013_sensordef() : sonar(NULL) {}
+
+  P_013_sensordef(byte TRIG_Pin, byte IRQ_Pin, int16_t max_cm_distance) : sonar(NULL) {
+    sonar = new NewPingESP8266(TRIG_Pin, IRQ_Pin, max_cm_distance);
+  }
+
+  ~P_013_sensordef() {
+    if (sonar != NULL) {
+      delete sonar;
+      sonar = NULL;
+    }
+  }
+
+  NewPingESP8266 *sonar;
+};
+
+std::map<unsigned int, P_013_sensordef> P_013_sensordefs;
+
+
+
 
 boolean Plugin_013(byte function, struct EventStruct *event, String& string)
 {
@@ -59,12 +77,15 @@ boolean Plugin_013(byte function, struct EventStruct *event, String& string)
         options[0] = F("Value");
         options[1] = F("State");
         int optionValues[2] = { 1, 2 };
-        addFormSelector(string, F("Mode"), F("plugin_013_mode"), 2, options, optionValues, choice);
+        addFormSelector(F("Mode"), F("plugin_013_mode"), 2, options, optionValues, choice);
 
         if (Settings.TaskDevicePluginConfig[event->TaskIndex][0] == 2)
         {
-        	addFormNumericBox(string, F("Threshold"), F("plugin_013_threshold"), Settings.TaskDevicePluginConfig[event->TaskIndex][1]);
+        	addFormNumericBox(F("Threshold"), F("plugin_013_threshold"), Settings.TaskDevicePluginConfig[event->TaskIndex][1]);
         }
+        addFormNumericBox(F("Max Distance"), F("plugin_013_max_distance"), Settings.TaskDevicePluginConfig[event->TaskIndex][2], 0, 500);
+        addUnit(F("cm"));
+
         success = true;
         break;
       }
@@ -76,18 +97,53 @@ boolean Plugin_013(byte function, struct EventStruct *event, String& string)
         {
           Settings.TaskDevicePluginConfig[event->TaskIndex][1] = getFormItemInt(F("plugin_013_threshold"));
         }
+        Settings.TaskDevicePluginConfig[event->TaskIndex][2] = getFormItemInt(F("plugin_013_max_distance"));
         success = true;
         break;
       }
 
     case PLUGIN_INIT:
       {
-        Plugin_013_init = true;
-        pinMode(Settings.TaskDevicePin1[event->TaskIndex], OUTPUT);
-        pinMode(Settings.TaskDevicePin2[event->TaskIndex], INPUT_PULLUP);
-        Plugin_013_IRQ_Pin = Settings.TaskDevicePin2[event->TaskIndex];
-        attachInterrupt(Settings.TaskDevicePin2[event->TaskIndex], Plugin_013_interrupt, CHANGE);
+        byte Plugin_013_TRIG_Pin = Settings.TaskDevicePin1[event->TaskIndex];
+        byte Plugin_013_IRQ_Pin = Settings.TaskDevicePin2[event->TaskIndex];
+        int16_t max_cm_distance = Settings.TaskDevicePluginConfig[event->TaskIndex][2];
+        P_013_sensordefs[event->TaskIndex] =
+          P_013_sensordef(Plugin_013_TRIG_Pin, Plugin_013_IRQ_Pin, max_cm_distance);
+        String log = F("ULTRASONIC : TaskNr: ");
+        log += event->TaskIndex +1;
+        log += F(" TrigPin: ");
+        log += Plugin_013_TRIG_Pin;
+        log += F(" IRQ_Pin: ");
+        log += Plugin_013_IRQ_Pin;
+        log += F(" max dist cm: ");
+        log += max_cm_distance;
+        log += F(" max echo: ");
+        log += P_013_sensordefs[event->TaskIndex].sonar->getMaxEchoTime();
+        log += F(" nr_tasks: ");
+        log += P_013_sensordefs.size();
+        addLog(LOG_LEVEL_INFO, log);
+
+        unsigned long tmpmillis = millis();
+        unsigned long tmpmicros = micros();
+        delay(100);
+        long millispassed = timePassedSince(tmpmillis);
+        long microspassed = usecPassedSince(tmpmicros);
+
+        log = F("ULTRASONIC : micros() test: ");
+        log += millispassed;
+        log += F(" msec, ");
+        log += microspassed;
+        log += F(" usec, ");
+        addLog(LOG_LEVEL_INFO, log);
+
+
         success = true;
+        break;
+      }
+
+    case PLUGIN_EXIT:
+      {
+        P_013_sensordefs.erase(event->TaskIndex);
         break;
       }
 
@@ -95,9 +151,10 @@ boolean Plugin_013(byte function, struct EventStruct *event, String& string)
       {
         if (Settings.TaskDevicePluginConfig[event->TaskIndex][0] == 1)
         {
-          Plugin_013_TRIG_Pin = Settings.TaskDevicePin1[event->TaskIndex];
-          float value = Plugin_013_read();
-          String log = F("SR04 : Distance: ");
+          float value = Plugin_013_read(event->TaskIndex);
+          String log = F("ULTRASONIC : TaskNr: ");
+          log += event->TaskIndex +1;
+          log += F(" Distance: ");
           if (value > 0)
           {
             UserVar[event->BaseVarIndex] = value;
@@ -116,16 +173,15 @@ boolean Plugin_013(byte function, struct EventStruct *event, String& string)
       {
         if (Settings.TaskDevicePluginConfig[event->TaskIndex][0] == 2)
         {
-          Plugin_013_TRIG_Pin = Settings.TaskDevicePin1[event->TaskIndex];
           byte state = 0;
-          float value = Plugin_013_read();
+          float value = Plugin_013_read(event->TaskIndex);
           if (value > 0)
           {
             if (value < Settings.TaskDevicePluginConfig[event->TaskIndex][1])
               state = 1;
             if (state != switchstate[event->TaskIndex])
             {
-              String log = F("SR04 : State ");
+              String log = F("ULTRASONIC : State ");
               log += state;
               addLog(LOG_LEVEL_INFO,log);
               switchstate[event->TaskIndex] = state;
@@ -143,42 +199,14 @@ boolean Plugin_013(byte function, struct EventStruct *event, String& string)
 }
 
 /*********************************************************************/
-float Plugin_013_read()
+float Plugin_013_read(unsigned int taskIndex)
 /*********************************************************************/
 {
-  float value = -1;
-  Plugin_013_timer = 0;
-  Plugin_013_state = 0;
-  noInterrupts();
-  digitalWrite(Plugin_013_TRIG_Pin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(Plugin_013_TRIG_Pin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(Plugin_013_TRIG_Pin, LOW);
-  interrupts();
-
-  delay(25);  // wait for measurement to finish (max 400 cm * 58 uSec = 23uSec)
-  if (Plugin_013_state == 2)
-  {
-    value = (float)Plugin_013_timer / 58;
-  }
-  return value;
-}
-
-/*********************************************************************/
-void Plugin_013_interrupt()
-/*********************************************************************/
-{
-  byte pinState = digitalRead(Plugin_013_IRQ_Pin);
-  if (pinState == 1) // Start of pulse
-  {
-    Plugin_013_state = 1;
-    Plugin_013_timer = micros();
-  }
-  else // End of pulse, calculate timelapse between start & end
-  {
-    Plugin_013_state = 2;
-    Plugin_013_timer = micros() - Plugin_013_timer;
-  }
+  if (P_013_sensordefs.count(taskIndex) == 0) return 0;
+  if (P_013_sensordefs[taskIndex].sonar == NULL) return 0;
+  delay(1);
+  float distance = P_013_sensordefs[taskIndex].sonar->ping_cm();
+  delay(1);
+  return distance;
 }
 #endif // USES_P013
